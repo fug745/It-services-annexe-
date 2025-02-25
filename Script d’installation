@@ -1,0 +1,41 @@
+#!/bin/bash
+set -e
+
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> /tmp/install.log
+}
+
+log_message "Début de l'installation"
+
+sleep 30
+sudo apt-get update -y >> /tmp/install.log 2>&1
+
+# Installation de Nginx
+log_message "Installation de Nginx"
+sudo apt-get install -y nginx >> /tmp/install.log 2>&1
+sudo systemctl enable nginx
+sudo systemctl start nginx
+
+# Installation de Node.js 18
+log_message "Installation de Node.js"
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - >> /tmp/install.log 2>&1
+sudo apt-get install -y nodejs >> /tmp/install.log 2>&1
+
+# Installation .NET SDK 8 et ASP.NET 8
+log_message "Installation de .NET SDK et ASP.NET Core"
+sudo apt-get update -y
+sudo apt-get install -y dotnet-sdk-8.0 aspnetcore-runtime-8.0 >> /tmp/install.log 2>&1
+
+# Installation Angular CLI
+log_message "Installation de l'Angular CLI"
+npm install -g @angular/cli
+
+# Test de Nginx
+log_message "Test Nginx"
+if curl -s http://localhost/ > /dev/null; then
+    log_message "Nginx fonctionne correctement"
+else
+    log_message "ERREUR: Nginx ne répond pas"
+fi
+
+log_message "Installation terminée !"
