@@ -1,0 +1,90 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v3
+        with:
+          repository: AAAEP/agenda-bryan
+          path: backend
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build .NET solution
+        run: dotnet build backend/Agenda.API.sln --configuration Release
+
+      - name: Run .NET Unit Tests
+        run: dotnet test backend/Agenda.API.sln --configuration Release --no-restore --verbosity normal || true
+
+      - name: Publish .NET
+        run: dotnet publish backend/Agenda.API.sln -c Release -o publish --self-contained false
+
+      - name: Deploiement vers EC2
+        run: |
+          echo -e "${{ secrets.EC2_SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+          trap "rm -f id_rsa" EXIT  # Nettoyage auto de la clé privée même en cas d'erreur
+
+          BRANCH_NAME=$(echo "${{ github.ref }}" | sed 's|refs/heads/||')
+          if [[ "$BRANCH_NAME" == "dev" ]]; then
+            IP=${{ secrets.IP_EC2_TEST }}
+          else
+            IP=${{ secrets.IP_EC2_PROD }}
+          fi
+
+          echo "Deploying to $IP..."
+
+          # 🚀 Optimisation : Utilisation de rsync au lieu de scp pour envoyer uniquement les fichiers modifiés
+          rsync -avz --progress -e "ssh -o StrictHostKeyChecking=no -i id_rsa" publish/ ubuntu@$IP:/tmp/dotnet/
+
+          # 🚀 Exécuter le déploiement en SSH (plus rapide et optimisé)
+          ssh -o StrictHostKeyChecking=no -i id_rsa ubuntu@$IP << 'EOT'
+            echo "🧹 Cleaning old .NET files..."
+            sudo rm -rf /home/ubuntu/dotnet
+            sudo mkdir -p /home/ubuntu/dotnet
+            sudo chown ubuntu:ubuntu /home/ubuntu/dotnet
+
+            echo "🚀 Moving new files..."
+            sudo rsync -avz /tmp/dotnet/ /home/ubuntu/dotnet/
+
+            if [ ! -f /etc/systemd/system/dotnet-api.service ]; then
+              echo "⚙️ Creating systemd service..."
+              sudo bash -c "cat > /etc/systemd/system/dotnet-api.service <<EOF
+            [Unit]
+            Description=DotNet API
+            After=network.target
+
+            [Service]
+            WorkingDirectory=/home/ubuntu/dotnet
+            ExecStart=/usr/bin/dotnet /home/ubuntu/dotnet/Agenda.API.dll
+            Restart=always
+            RestartSec=5
+            KillSignal=SIGINT
+            SyslogIdentifier=dotnet-api
+            User=ubuntu
+            Environment=ASPNETCORE_ENVIRONMENT=Production
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF"
+            fi
+
+            echo "🔄 Restarting .NET service..."
+            sudo systemctl daemon-reload
+            sudo systemctl enable dotnet-api
+            sudo systemctl restart dotnet-api &
+          EOT
+
+          echo "✅ Deployment completed!"
