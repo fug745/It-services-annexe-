@@ -1,0 +1,149 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev  # Déploiement automatique sur test
+      - main # Déploiement automatique sur prod
+  workflow_dispatch:  # Permet un déploiement manuel
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Étape de debug pour vérifier la clé SSH
+      - name: Debug SSH Key and Test EC2 Connection
+        run: |
+          echo -e "${{ secrets.EC2_SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+          echo "Public key derived from id_rsa:"
+          ssh-keygen -y -f id_rsa
+          if [[ "${{ github.ref_name }}" == "dev" ]]; then
+            IP=${{ secrets.IP_EC2_TEST }}
+          else
+            IP=${{ secrets.IP_EC2_PROD }}
+          fi
+          echo "Test de connexion sur l'instance EC2 ($IP)..."
+          ssh -o StrictHostKeyChecking=no -i id_rsa ubuntu@$IP "echo 'Connection successful'" || { echo "EC2 connection test failed"; exit 1; }
+          rm id_rsa
+
+      # 1️⃣ Cloner les deux dépôts (Backend & Frontend)
+      - name: Checkout backend
+        uses: actions/checkout@v3
+        with:
+          repository: AAAEP/agenda-bryan
+          path: backend
+
+      - name: Checkout frontend
+        uses: actions/checkout@v3
+        with:
+          repository: AAAEP/projet-agenda-app
+          token: ${{ secrets.PRIVATE_TOKEN }}
+          path: frontend
+
+      # 2️⃣ Installer Node.js et Angular
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.19.0'
+
+      - name: Clean NPM cache
+        run: npm cache clean --force
+
+      - name: Remove node_modules and package-lock.json in frontend
+        run: rm -rf node_modules package-lock.json
+        working-directory: frontend
+
+      - name: Install Angular dependencies
+        run: npm ci --legacy-peer-deps || npm install
+        working-directory: frontend
+
+      - name: Build Angular
+        run: npm run build -- --configuration production
+        working-directory: frontend
+
+      # 3️⃣ Installer .NET et compiler le backendo
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build .NET solution
+        run: dotnet build backend/Agenda.API.sln --configuration Release
+
+      - name: Publish .NET
+        run: dotnet publish backend/Agenda.API.sln -c Release -o publish
+
+      # 4️⃣ Déploiement sur EC2
+      - name: Deploy to EC2
+        run: |
+          echo -e "${{ secrets.EC2_SSH_KEY }}" > id_rsa
+          chmod 600 id_rsa
+          if [[ "${{ github.ref_name }}" == "dev" ]]; then
+            IP=${{ secrets.IP_EC2_TEST }}
+          else
+            IP=${{ secrets.IP_EC2_PROD }}
+          fi
+          # Transférer les fichiers Angular et .NET
+          scp -o StrictHostKeyChecking=no -i id_rsa -r frontend/dist/* ubuntu@$IP:/tmp/angular
+          scp -o StrictHostKeyChecking=no -i id_rsa -r publish/* ubuntu@$IP:/tmp/dotnet
+          # Connexion SSH pour déployer
+          ssh -o StrictHostKeyChecking=no -i id_rsa ubuntu@$IP << 'EOT'
+            if ! command -v dotnet &> /dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y dotnet-sdk-6.0 aspnetcore-runtime-6.0
+            fi
+            if ! command -v nginx &> /dev/null; then
+              sudo apt-get install -y nginx
+              sudo systemctl enable nginx
+              sudo systemctl start nginx
+            fi
+            sudo rm -rf /var/www/angular-app/*
+            sudo mkdir -p /var/www/angular-app
+            sudo mv /tmp/angular/* /var/www/angular-app/
+            sudo rm -rf /home/ubuntu/dotnet
+            sudo mkdir -p /home/ubuntu/dotnet
+            sudo mv /tmp/dotnet/* /home/ubuntu/dotnet/
+            sudo bash -c "cat > /etc/nginx/sites-available/angular-app <<EOF
+            server {
+                listen 80;
+                server_name _;
+                root /var/www/angular-app;
+                index index.html;
+                location / {
+                    try_files \$uri /index.html;
+                }
+                error_page 404 /index.html;
+                location /api/ {
+                    proxy_pass http://localhost:5000/;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                }
+            }
+            EOF"
+            sudo ln -sf /etc/nginx/sites-available/angular-app /etc/nginx/sites-enabled/angular-app
+            sudo systemctl restart nginx
+            sudo bash -c "cat > /etc/systemd/system/dotnet-api.service <<EOF
+            [Unit]
+            Description=DotNet API
+            After=network.target
+            [Service]
+            WorkingDirectory=/home/ubuntu/dotnet
+            ExecStart=/usr/bin/dotnet /home/ubuntu/dotnet/Agenda.API.dll
+            Restart=always
+            RestartSec=10
+            KillSignal=SIGINT
+            SyslogIdentifier=dotnet-api
+            User=ubuntu
+            Environment=ASPNETCORE_ENVIRONMENT=Production
+            [Install]
+            WantedBy=multi-user.target
+            EOF"
+            sudo systemctl daemon-reload
+            sudo systemctl enable dotnet-api
+            sudo systemctl restart dotnet-api
+          EOT
+          rm id_rsa
